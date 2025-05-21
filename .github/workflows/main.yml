@@ -1,58 +1,16 @@
 name: Build and Release
 
 on:
-  pull_request:
-    branches:
-      - master
-    types:
-      - opened
-      - synchronize
-      - reopened
   push:
     branches:
       - master
+    tags:
+      - '*'
   workflow_dispatch:
 
-concurrency:
-  group: '${{ github.workflow }}-${{ github.ref }}'
-  cancel-in-progress: true
-
 jobs:
-  github_env:
-    name: GitHub Env Debug
-    runs-on: ubuntu-latest
-    steps:
-      - name: Dump github context
-        run: echo "$GITHUB_CONTEXT"
-        shell: bash
-        env:
-          GITHUB_CONTEXT: ${{ toJson(github) }}
-
-  setup_release:
-    name: Setup Release
-    outputs:
-      publish_release: ${{ steps.setup_release.outputs.publish_release }}
-      release_body: ${{ steps.setup_release.outputs.release_body }}
-      release_commit: ${{ steps.setup_release.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.setup_release.outputs.release_generate_release_notes }}
-      release_tag: ${{ steps.setup_release.outputs.release_tag }}
-      release_version: ${{ steps.setup_release.outputs.release_version }}
-    permissions:
-      contents: write  # read does not work to check squash and merge details
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Release
-        id: setup_release
-        uses: LizardByte/setup-release-action@v2025.426.225
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          
   build_win:
     name: Windows
-    needs: setup_release
     runs-on: windows-2019
     steps:
       - name: Checkout
@@ -60,7 +18,14 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Move Repo
+        shell: pwsh
+        run: |
+          cd ..
+          cp -r Sunshine-Foundation ../Sunshine
+
       - name: Setup Dependencies Windows
+        # if a dependency needs to be pinned, see https://github.com/LizardByte/build-deps/pull/186
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
@@ -70,8 +35,9 @@ jobs:
 
       - name: Update Windows dependencies
         env:
-          gcc_version: '14.2.0-3'
+          gcc_version: "14.2.0-3"
         shell: msys2 {0}
+        working-directory: ../../Sunshine
         run: |
           broken_deps=(
             "mingw-w64-ucrt-x86_64-gcc"
@@ -113,12 +79,37 @@ jobs:
 
           pacman -Syu --noconfirm --ignore="$(IFS=,; echo "${broken_deps[*]}")" "${dependencies[@]}"
 
+      - name: Install Doxygen
+        # GCC compiled doxygen has issues when running graphviz
+        env:
+          DOXYGEN_VERSION: "1.11.0"
+        working-directory: ../../Sunshine
+        run: |
+          # Set version variables
+          $doxy_ver = $env:DOXYGEN_VERSION
+          $_doxy_ver = $doxy_ver.Replace(".", "_")
+
+          # Download the Doxygen installer
+          Invoke-WebRequest -Uri `
+            "https://github.com/doxygen/doxygen/releases/download/Release_${_doxy_ver}/doxygen-${doxy_ver}-setup.exe" `
+            -OutFile "doxygen-setup.exe"
+
+          # Run the installer
+          Start-Process `
+            -FilePath .\doxygen-setup.exe `
+            -ArgumentList `
+              '/VERYSILENT' `
+          -Wait `
+          -NoNewWindow
+
+          # Clean up
+          Remove-Item -Path doxygen-setup.exe
+
       - name: Build Windows
         shell: msys2 {0}
+        working-directory: ../../Sunshine
         env:
           BRANCH: ${{ github.head_ref || github.ref_name }}
-          BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
-          COMMIT: ${{ needs.setup_release.outputs.release_commit }}
         run: |
           mkdir -p build
           cmake \
@@ -126,61 +117,26 @@ jobs:
             -G Ninja \
             -S . \
             -DBUILD_DOCS=OFF \
-            -DSUNSHINE_ASSETS_DIR=assets \
-            -DSUNSHINE_PUBLISHER_NAME='${{ github.repository_owner }}' \
-            -DSUNSHINE_PUBLISHER_WEBSITE='https://app.lizardbyte.dev' \
-            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://app.lizardbyte.dev/support'
+            -DSUNSHINE_ASSETS_DIR=assets
           ninja -C build
 
-      - name: Package Windows
-        shell: msys2 {0}
+      - name: Move Artifacts
+        shell: pwsh
         run: |
-          mkdir -p artifacts
+          mkdir build
           cd build
+          cp -r ../../../Sunshine/build/* ./
 
-          # package
-          cpack -G NSIS
-          # cpack -G ZIP
-
-          # move
-          mv ./cpack_artifacts/Sunshine.exe ../artifacts/sunshine-windows-installer.exe
-          # mv ./cpack_artifacts/Sunshine.zip ../artifacts/sunshine-windows-portable.zip
-
-      - name: Package Windows Debug Info
-        working-directory: build
-        run: |
-          # use .dbg file extension for binaries to avoid confusion with real packages
-          Get-ChildItem -File -Recurse | `
-            % { Rename-Item -Path $_.PSPath -NewName $_.Name.Replace(".exe",".dbg") }
-
-          # save the binaries with debug info
-          7z -r `
-            "-xr!CMakeFiles" `
-            "-xr!cpack_artifacts" `
-            a "../artifacts/sunshine-win32-debuginfo.7z" "*.dbg"
-
-      # - name: Upload Artifacts
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: sunshine-windows
-      #     path: artifacts/
-      #     if-no-files-found: error
-
-      - name: Upload Single Executable
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sunshine-founation
-          path: artifacts/sunshine-windows-installer.exe
+          name: build
+          path: build/
           if-no-files-found: error
 
-      - name: Create/Update GitHub Release
-        if: needs.setup_release.outputs.publish_release == 'true'
-        uses: LizardByte/create-release-action@v2025.426.1549
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
         with:
-          allowUpdates: true
-          body: ${{ needs.setup_release.outputs.release_body }}
-          generateReleaseNotes: ${{ needs.setup_release.outputs.release_generate_release_notes }}
-          name: ${{ needs.setup_release.outputs.release_tag }}
-          prerelease: true
-          tag: ${{ needs.setup_release.outputs.release_tag }}
-          token: ${{ secrets.GH_BOT_TOKEN }}
+          name: sunshine
+          path: build/sunshine.exe
+          if-no-files-found: error
