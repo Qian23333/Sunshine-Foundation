@@ -115,7 +115,7 @@ namespace confighttp {
       return false;
     }
 
-    if (ip_type == net::PC) {
+    if (ip_type != net::WAN) {
       return true;
     }
 
